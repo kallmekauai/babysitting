@@ -17,6 +17,9 @@ import {
 } from "lucide-react";
 import { Link, NavLink, Route, Routes, useLocation } from "react-router-dom";
 import { isSupabaseConfigured, supabase } from "./lib/supabase";
+import AvailabilityDashboard from "./AvailabilityDashboard";
+import AvailabilityCalendar, { dateKey } from "./AvailabilityCalendar";
+import type { AvailabilityWindow } from "./AvailabilityCalendar";
 
 const links = [
   { to: "/about", label: "About me" },
@@ -265,12 +268,115 @@ function ServicesPage() {
   );
 }
 
+type PublicAvailabilityWindow = AvailabilityWindow & {
+  availability_date: string;
+  minimum_duration_minutes: number;
+  travel_buffer_minutes: number;
+};
+
+type StartOption = {
+  value: string;
+  windowIndex: number;
+};
+
+function timeToMinutes(value: string) {
+  const [hours, minutes] = value.split(":").map(Number);
+  return hours * 60 + minutes;
+}
+
+function timeFromMinutes(value: number) {
+  return `${String(Math.floor(value / 60)).padStart(2, "0")}:${String(value % 60).padStart(2, "0")}`;
+}
+
+function formatTime(value: string) {
+  const [hours, minutes] = value.split(":").map(Number);
+  return `${hours % 12 || 12}:${String(minutes).padStart(2, "0")} ${hours < 12 ? "AM" : "PM"}`;
+}
+
 function BookingPage() {
   const [result, setResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [childrenCount, setChildrenCount] = useState("1");
+  const [availabilityRows, setAvailabilityRows] = useState<PublicAvailabilityWindow[]>([]);
+  const [availabilityLoading, setAvailabilityLoading] = useState(true);
+  const [availabilityError, setAvailabilityError] = useState("");
+  const [requestedDate, setRequestedDate] = useState("");
+  const [selectedStart, setSelectedStart] = useState("");
+  const [selectedEnd, setSelectedEnd] = useState("");
+  const [availabilityMonth, setAvailabilityMonth] = useState(() => {
+    const today = new Date(`${new Intl.DateTimeFormat("en-CA", { timeZone: "America/Phoenix" }).format(new Date())}T12:00:00`);
+    return new Date(today.getFullYear(), today.getMonth(), 1);
+  });
   const oneChildEstimate = childrenCount === "1";
   const todayPhoenix = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Phoenix" }).format(new Date());
+  const monthStart = dateKey(new Date(availabilityMonth.getFullYear(), availabilityMonth.getMonth(), 1));
+  const monthEnd = dateKey(new Date(availabilityMonth.getFullYear(), availabilityMonth.getMonth() + 1, 0));
+  const availabilityByDate = new Map<string, PublicAvailabilityWindow[]>();
+  for (const window of availabilityRows) {
+    const dayWindows = availabilityByDate.get(window.availability_date) ?? [];
+    dayWindows.push(window);
+    availabilityByDate.set(window.availability_date, dayWindows);
+  }
+  const selectedWindows = availabilityByDate.get(requestedDate) ?? [];
+  const minimumDuration = selectedWindows[0]?.minimum_duration_minutes ?? 60;
+  const travelBuffer = selectedWindows[0]?.travel_buffer_minutes ?? 0;
+  const startOptions: StartOption[] = selectedWindows.flatMap((window, windowIndex) => {
+    const start = timeToMinutes(window.start_time);
+    const latestStart = timeToMinutes(window.end_time) - minimumDuration - travelBuffer;
+    const options: StartOption[] = [];
+    for (let time = start; time <= latestStart; time += 30) {
+      options.push({ value: timeFromMinutes(time), windowIndex });
+    }
+    return options;
+  });
+  const chosenStartOption = startOptions.find((option) => option.value === selectedStart);
+  const chosenWindow = chosenStartOption ? selectedWindows[chosenStartOption.windowIndex] : undefined;
+  const endOptions = chosenWindow && selectedStart
+    ? Array.from(
+      { length: Math.floor((timeToMinutes(chosenWindow.end_time) - travelBuffer - timeToMinutes(selectedStart) - minimumDuration) / 30) + 1 },
+      (_, index) => timeFromMinutes(timeToMinutes(selectedStart) + minimumDuration + index * 30),
+    )
+    : [];
+
+  useEffect(() => {
+    let active = true;
+    async function loadAvailability() {
+      if (!supabase) {
+        setAvailabilityRows([]);
+        setAvailabilityError("Availability is not connected yet. Please contact me to ask about dates.");
+        setAvailabilityLoading(false);
+        return;
+      }
+      setAvailabilityLoading(true);
+      const { data, error } = await supabase.rpc("get_childcare_availability", {
+        p_start_date: monthStart,
+        p_end_date: monthEnd,
+      });
+      if (!active) return;
+      if (error) {
+        setAvailabilityRows([]);
+        setAvailabilityError("Available dates could not be loaded. Please try again later or contact me directly.");
+      } else {
+        setAvailabilityRows((data ?? []) as PublicAvailabilityWindow[]);
+        setAvailabilityError("");
+      }
+      setAvailabilityLoading(false);
+    }
+
+    void loadAvailability();
+    const refresh = () => {
+      if (document.visibilityState === "visible") void loadAvailability();
+    };
+    const interval = window.setInterval(refresh, 30_000);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [monthStart, monthEnd]);
 
   async function submitRequest(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -279,10 +385,26 @@ function BookingPage() {
       setResult({ ok: false, message: "Online booking isn’t connected yet. Please check back soon or contact me directly." });
       return;
     }
+    const formElement = event.currentTarget;
+    if (!requestedDate || !selectedStart || !selectedEnd) {
+      setResult({ ok: false, message: "Please choose an available date, start time, and end time." });
+      return;
+    }
+    const startMinutes = timeToMinutes(selectedStart);
+    const endMinutes = timeToMinutes(selectedEnd);
+    const matchingWindow = availabilityRows.find((window) =>
+      window.availability_date === requestedDate
+      && startMinutes >= timeToMinutes(window.start_time)
+      && endMinutes <= timeToMinutes(window.end_time) - window.travel_buffer_minutes,
+    );
+    if (!matchingWindow || endMinutes - startMinutes < matchingWindow.minimum_duration_minutes || requestedDate < todayPhoenix) {
+      setResult({ ok: false, message: "That time is no longer available. Please choose another date or time." });
+      return;
+    }
 
-    const form = new FormData(event.currentTarget);
-    const startTime = String(form.get("start_time") ?? "");
-    const endTime = String(form.get("end_time") ?? "");
+    const form = new FormData(formElement);
+    const startTime = selectedStart;
+    const endTime = selectedEnd;
     if (startTime >= endTime) {
       setResult({ ok: false, message: "Please choose an end time after your start time." });
       return;
@@ -310,8 +432,11 @@ function BookingPage() {
       return;
     }
     setResult({ ok: true, message: "Your request is in! It’s pending approval, and I’ll be in touch after I confirm the details." });
-    event.currentTarget.reset();
+    formElement.reset();
     setChildrenCount("1");
+    setRequestedDate("");
+    setSelectedStart("");
+    setSelectedEnd("");
   }
 
   return (
@@ -324,11 +449,39 @@ function BookingPage() {
       <div className="booking-layout section-wrap">
         <form className="booking-form" onSubmit={submitRequest}>
           <div className="form-section-heading"><span>01</span><div><h2>When & where</h2><p>Tell me what you have in mind.</p></div></div>
+          <div className="booking-calendar-section">
+            <h3>Choose an available date</h3>
+            {isSupabaseConfigured && <AvailabilityCalendar
+              month={availabilityMonth}
+              selectedDate={requestedDate}
+              minimumDate={todayPhoenix}
+              availabilityByDate={availabilityByDate}
+              onSelectDate={(date) => {
+                setRequestedDate(date);
+                setSelectedStart("");
+                setSelectedEnd("");
+                setResult(null);
+              }}
+              onMonthChange={setAvailabilityMonth}
+            />}
+            {availabilityLoading && <p className="calendar-status" role="status">Loading available dates…</p>}
+            {availabilityError && <p className="calendar-status calendar-status-error" role="status">{availabilityError}</p>}
+            {requestedDate && <p className="calendar-selection" role="status">
+              {new Intl.DateTimeFormat("en-US", { dateStyle: "full" }).format(new Date(`${requestedDate}T12:00:00`))}
+              {selectedWindows.length > 0 && <span>{selectedWindows.map((window) => `${formatTime(window.start_time)}–${formatTime(window.end_time)}`).join(", ")}</span>}
+            </p>}
+          </div>
           <div className="form-grid">
-            <label className="form-field"><span>Preferred date <b>*</b></span><input type="date" name="requested_date" min={todayPhoenix} required /></label>
+            <input type="hidden" name="requested_date" value={requestedDate} />
             <label className="form-field"><span>Neighborhood or general location <b>*</b></span><input type="text" name="location" autoComplete="address-level2" placeholder="e.g. Arcadia, Phoenix" required maxLength={120} /></label>
-            <label className="form-field"><span>Start time <b>*</b></span><input type="time" name="start_time" required /></label>
-            <label className="form-field"><span>End time <b>*</b></span><input type="time" name="end_time" required /></label>
+            <label className="form-field"><span>Start time <b>*</b></span><select name="start_time" value={selectedStart} onChange={(event) => {
+              const nextStart = event.target.value;
+              const option = startOptions.find((item) => item.value === nextStart);
+              setSelectedStart(nextStart);
+              const window = option ? selectedWindows[option.windowIndex] : undefined;
+              setSelectedEnd(window ? timeFromMinutes(timeToMinutes(nextStart) + window.minimum_duration_minutes) : "");
+            }} required disabled={!requestedDate || startOptions.length === 0}><option value="">Choose a start time</option>{startOptions.map((option, index) => <option value={option.value} key={`${option.value}-${index}`}>{formatTime(option.value)}</option>)}</select></label>
+            <label className="form-field"><span>End time <b>*</b></span><select name="end_time" value={selectedEnd} onChange={(event) => setSelectedEnd(event.target.value)} required disabled={!selectedStart || endOptions.length === 0}><option value="">Choose an end time</option>{endOptions.map((time) => <option value={time} key={time}>{formatTime(time)}</option>)}</select></label>
             <label className="form-field form-full"><span>Number of children <b>*</b></span><select name="children_count" value={childrenCount} onChange={(event) => setChildrenCount(event.target.value)}><option value="1">1 child</option><option value="2">2 children</option><option value="3">3 children</option><option value="4">4 children</option></select></label>
           </div>
           <div className="form-section-heading form-heading-spaced"><span>02</span><div><h2>A little about you</h2><p>So I know who to get back to.</p></div></div>
@@ -438,7 +591,7 @@ function AdminPage() {
       <section className="page-intro admin-intro"><span className="eyebrow"><LockKeyhole size={13} /> Private area</span><h1>Your care<br /><em>dashboard.</em></h1><p>Private booking management. Only an authenticated admin account can view requests.</p></section>
       {!isSupabaseConfigured ? <div className="admin-config-card"><LockKeyhole size={22} /><h2>Private dashboard not connected</h2><p>Connect Supabase and configure admin access before this dashboard can display booking requests.</p></div>
         : !sessionEmail ? <form className="admin-login" onSubmit={signIn}><h2>Welcome back</h2><p>Sign in with your private admin account.</p><label className="form-field"><span>Email address</span><input type="email" autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} required /></label><label className="form-field"><span>Password</span><input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label>{message && <p className="admin-message" role="status">{message}</p>}<button className="button button-dark button-full" disabled={busy}>{busy ? "Signing in…" : "Sign in securely"} <ArrowRight size={15} /></button></form>
-        : <section className="admin-bookings"><div className="admin-bookings-heading"><div><span className="eyebrow"><span className="eyebrow-dot" /> Signed in as {sessionEmail}</span><h2>Booking requests</h2></div><button className="text-link logout-button" onClick={() => void supabase?.auth.signOut()}>Sign out <ArrowRight size={14} /></button></div>{message && <p className="admin-message" role="status">{message}</p>}{rows.length === 0 ? <div className="empty-state"><CalendarDays size={24} /><h3>No requests yet</h3><p>New booking requests will appear here once they’re connected to the database.</p></div> : <div className="booking-table">{rows.map((booking) => <article className="admin-booking-row" key={booking.id}><div className="admin-booking-date">{booking.requested_date}<small>{booking.start_time}–{booking.end_time}</small></div><div className="admin-booking-info"><strong>{booking.parent_name} · {booking.children_count} {booking.children_count === 1 ? "child" : "children"}</strong><small>{booking.parent_email} · {booking.parent_phone}</small></div><span className={`status-chip ${booking.status}`}>{booking.status.replace("_", " ")}</span>{booking.status === "pending_approval" && <div className="booking-actions"><button disabled={busy} onClick={() => void updateBooking(booking.id, "approve")}>Approve</button><button disabled={busy} onClick={() => void updateBooking(booking.id, "decline")}>Decline</button></div>}</article>)}</div>}</section>}
+        : <section className="admin-bookings"><div className="admin-bookings-heading"><div><span className="eyebrow"><span className="eyebrow-dot" /> Signed in as {sessionEmail}</span><h2>Your schedule</h2></div><button className="text-link logout-button" onClick={() => void supabase?.auth.signOut()}>Sign out <ArrowRight size={14} /></button></div><AvailabilityDashboard /><div className="admin-bookings-heading appointments-heading"><div><span className="eyebrow"><span className="eyebrow-dot" /> Families & appointments</span><h2>Booking requests</h2></div></div>{message && <p className="admin-message" role="status">{message}</p>}{rows.length === 0 ? <div className="empty-state"><CalendarDays size={24} /><h3>No requests yet</h3><p>New booking requests will appear here once they’re connected to the database.</p></div> : <div className="booking-table">{rows.map((booking) => <article className="admin-booking-row" key={booking.id}><div className="admin-booking-date">{booking.requested_date}<small>{booking.start_time}–{booking.end_time}</small></div><div className="admin-booking-info"><strong>{booking.parent_name} · {booking.children_count} {booking.children_count === 1 ? "child" : "children"}</strong><small>{booking.parent_email} · {booking.parent_phone}</small></div><span className={`status-chip ${booking.status}`}>{booking.status.replace("_", " ")}</span>{booking.status === "pending_approval" && <div className="booking-actions"><button disabled={busy} onClick={() => void updateBooking(booking.id, "approve")}>Approve</button><button disabled={busy} onClick={() => void updateBooking(booking.id, "decline")}>Decline</button></div>}</article>)}</div>}</section>}
     </main>
   );
 }
